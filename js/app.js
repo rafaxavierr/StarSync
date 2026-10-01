@@ -1,5 +1,6 @@
 /* MULTIPERFIL - protótipo. Camadas: DB (LocalStorage) · Sensores (simulados) · IA (regras/histórico) · UI
-   NOVAS FUNÇÕES: (1) OEE + alertas Telegram/WhatsApp · (2) Balanço de Massa Digital · (3) Eco-Eficiência (R$/balde) */
+   NOVAS FUNÇÕES: (1) OEE + alertas Telegram/WhatsApp · (2) Balanço de Massa Digital · (3) Eco-Eficiência (R$/balde)
+   NOVO FLUXO DE MISTURADORES: lista de OPs → checklist → cronômetro → conclusão → teste de qualidade */
 const K = 'multipERFIL_DB_v2'
 let DB,
   U,
@@ -645,9 +646,10 @@ function tick() {
     P.seg = 0
   }
   save()
+  /* a tela de misturadores NÃO é redesenhada aqui: ela tem formulários e o cronômetro se atualiza sozinho */
   if (
     U &&
-    ['bom', 'mix', 'dash', 'oee', 'ene'].includes(V) &&
+    ['bom', 'dash', 'oee', 'ene'].includes(V) &&
     Date.now() - TOUCH > 4000
   )
     draw()
@@ -995,10 +997,22 @@ function sugMix(v, m) {
   }
   return S[v]
 }
+/* fecha uma pausa em andamento e volta a contar o tempo */
+function mxFechaPausa(m) {
+  const o = op(m.op)
+  if (o)
+    (o.pausasMix = o.pausasMix || []).push({
+      motivo: m.motivo,
+      seg: Math.round((Date.now() - (m.pIni || Date.now())) / 1000),
+    })
+  m.motivo = null
+  m.t0 = Date.now()
+  m.status = 'PRODUZINDO'
+}
 function pausarMix(mid) {
   const m = DB.misturadores.find((x) => x.id === mid)
   if (m.status === 'PAUSADO') {
-    m.status = 'PRODUZINDO'
+    mxFechaPausa(m)
     log(`${m.id}: mistura retomada`)
     return draw(true)
   }
@@ -1017,6 +1031,8 @@ function sugerirMix(mid) {
 function confirmarPausaMix(mid) {
   const m = DB.misturadores.find((x) => x.id === mid),
     v = $('#mpm').value
+  m.acum = (m.acum || 0) + (Date.now() - m.t0)
+  m.pIni = Date.now()
   m.status = 'PAUSADO'
   m.motivo = v
   log(`${m.id} pausado: ${v}`)
@@ -1042,37 +1058,6 @@ function novoPedido() {
   save()
   draw()
   avisoPedido()
-}
-function iniciarMix(id) {
-  const m = DB.misturadores.find((x) => x.id === $('#mx' + id).value)
-  if (m.status !== 'DISPONÍVEL') return alert('Misturador ocupado')
-  const o = op(id)
-  m.status = 'PRODUZINDO'
-  m.op = id
-  m.t0 = Date.now()
-  m.carga = o.retrabalho && o.prod ? o.prod : Math.round(o.plan * 0.99)
-  if (!o.retrabalho) o.mpKg = m.carga
-  o.mix = m.id
-  o.operador = U.nome
-  o.status = 'EM MISTURA'
-  log(`Iniciou mistura no ${m.id} (OP ${pad(id)})`)
-  draw()
-}
-function finMix(mid) {
-  const m = DB.misturadores.find((x) => x.id === mid),
-    o = op(m.op)
-  o.prod = m.carga
-  o.status = 'AGUARDANDO LABORATÓRIO'
-  m.status = 'DISPONÍVEL'
-  m.op = null
-  m.carga = 0
-  log(`Finalizou mistura ${o.lote}, enviado ao laboratório`)
-  alerta('y', 'Lote ' + o.lote + ' aguardando qualidade')
-  if (ROLE[U.permissao].includes('lab')) ir('lab')
-  else {
-    alert('Lote enviado à qualidade.')
-    draw(true)
-  }
 }
 /* NOVO: pausar/retomar bomba (alimenta o controle de parada de linha) */
 function pausarBomba(bid) {
@@ -1113,6 +1098,258 @@ function religarBomba(bid) {
   alerta('g', `${b.id} voltou a operar`)
   draw(true)
 }
+/* ---------- MISTURADORES: novo fluxo (lista → checklist → cronômetro → conclusão → teste) ---------- */
+const MATS = [
+  ['QMI01A', 'Intermediário pré-mix'],
+  ['QS007', 'Água'],
+  ['QR002', 'Resina acrílica 50%'],
+  ['QA007', 'Dolomita #325'],
+  ['QD012', 'Alcalinizante (soda cáustica líquida)'],
+  ['QD011', 'Reológico (Rheolate / Rheotech / Euroflow)'],
+]
+/* faixas da folha de OP */
+const ESPEC = [
+  { k: 'd1', n: 'Densidade inicial', un: 'g/cm³', min: 1.76, max: 1.8, d: 3 },
+  { k: 'd2', n: 'Densidade final', un: 'g/cm³', min: 1.73, max: 1.75, d: 3 },
+  { k: 'ph', n: 'pH', un: '', min: 8, max: 9, d: 2 },
+  { k: 'placas', n: 'Placas', un: 'cm', min: 2.3, max: 2.4, d: 2 },
+  { k: 'balde', n: 'Peso do balde', un: 'kg', min: 0.53, max: 0.568, d: 3 },
+]
+const dentro = (v, e) => v >= e.min - 1e-9 && v <= e.max + 1e-9
+const escAttr = (s) =>
+  String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+const mxNovo = () => ({
+  tela: 'lista',
+  op: null,
+  mix: '',
+  mats: [],
+  t: { fita: 'OK' },
+})
+let MX = mxNovo()
+const mxFmt = (ms) => {
+  const s = Math.floor(ms / 1000),
+    p = (n) => String(n).padStart(2, '0')
+  return `${p(Math.floor(s / 3600))}:${p(Math.floor(s / 60) % 60)}:${p(s % 60)}`
+}
+const mxTempo = () => {
+  const m = DB.misturadores.find((x) => x.id === MX.mix)
+  return m && m.op === MX.op
+    ? (m.acum || 0) + (m.status === 'PRODUZINDO' ? Date.now() - m.t0 : 0)
+    : 0
+}
+/* atualiza só o cronômetro (sem redesenhar a tela) */
+setInterval(() => {
+  const e = $('#mxt')
+  if (e) e.textContent = mxFmt(mxTempo())
+}, 500)
+
+function mxIA(o) {
+  return o.retrabalho && o.sugestaoIA
+    ? `<div class="al y" style="margin:10px 0"><b>🤖 ${o.sugestaoIA.titulo}</b><br><b>Motivo:</b> ${o.sugestaoIA.motivo}<br><b>Melhoria:</b> ${o.sugestaoIA.melhoria}</div>`
+    : ''
+}
+function mxResumoTeste(o) {
+  const t = o.teste
+  if (!t) return ''
+  return `<div class="al g"><b>🧪 Teste realizado no misturador</b> · ${t.por} · ${t.em}${o.tempoMix ? ` · mistura: ${mxFmt(o.tempoMix * 1000)}` : ''}</div><div class="grid">${ESPEC.map(
+    (e) => {
+      const ok = dentro(t[e.k], e)
+      return `<div>${e.n}<br><b>${f(t[e.k], e.d)} ${e.un}</b> <span class="bd ${ok ? 'g' : 'r'}">${ok ? 'OK' : 'FORA'}</span><br><small>Faixa ${f(e.min, e.d)} – ${f(e.max, e.d)}</small></div>`
+    }
+  ).join(
+    ''
+  )}<div>Adesão de fita<br><span class="bd ${t.fita === 'OK' ? 'g' : 'r'}">${t.fita}</span></div></div>${t.obs ? `<p><small>Obs.: ${t.obs}</small></p>` : ''}`
+}
+
+/* 1) lista */
+function mxLista() {
+  const and = DB.ordensProducao.filter((o) => o.status === 'EM MISTURA'),
+    fila = DB.ordensProducao
+      .filter((o) => o.status === 'AGUARDANDO PRODUÇÃO')
+      .sort((a, b) => (b.prio === 'Alta') - (a.prio === 'Alta'))
+  return (
+    (and.length
+      ? `<h3>Em andamento</h3>${and.map((o) => `<div class="card"><div class="top"><h3>OP ${pad(o.id)} · ${o.produto}</h3>${bd(o.mixConcluida ? 'MISTURA CONCLUÍDA' : 'EM MISTURA')}</div><p>${f(o.plan)} kg · Lote ${o.lote} · ${o.mix || '—'}</p><button class="btn" onclick="mxContinuar(${o.id})">CONTINUAR</button></div>`).join('')}`
+      : '') +
+    `<h3>OPs aguardando produção</h3>` +
+    (fila
+      .map(
+        (o) =>
+          `<div class="card"><div class="top"><h3>OP ${pad(o.id)} · ${o.produto}</h3><div>${o.prio === 'Alta' ? '<span class="bd y">PRIORIDADE ALTA</span> ' : ''}${o.retrabalho ? `<span class="bd r">RETRABALHO #${o.retrabalho}</span>` : ''}</div></div><p>${f(o.plan)} kg · Lote ${o.lote} · Prazo ${o.prazo}</p>${mxIA(o)}<button class="btn ok" onclick="realizarOP(${o.id})">REALIZAR OP</button></div>`
+      )
+      .join('') || '<div class="card">Nenhuma OP na fila.</div>')
+  )
+}
+function realizarOP(id) {
+  const o = op(id),
+    liv = DB.misturadores.find((m) => m.status === 'DISPONÍVEL')
+  MX = {
+    tela: 'check',
+    op: id,
+    mix: liv ? liv.id : '',
+    mats: o.checklist
+      ? JSON.parse(JSON.stringify(o.checklist))
+      : MATS.map(([cod, nome]) => ({
+          cod,
+          nome,
+          on: false,
+          lote: '',
+          qtd: '',
+        })),
+    t: { fita: 'OK' },
+  }
+  draw(true)
+}
+function mxContinuar(id) {
+  const o = op(id)
+  MX = {
+    ...mxNovo(),
+    op: id,
+    mix: o.mix,
+    tela: o.mixConcluida ? 'conc' : 'cron',
+  }
+  draw(true)
+}
+function mxVoltar() {
+  MX = mxNovo()
+  draw(true)
+}
+
+/* 2) checklist de matérias-primas */
+function matOn(i, v) {
+  MX.mats[i].on = v
+  draw(true)
+}
+function addMat() {
+  MX.mats.push({ cod: '', nome: '', custom: true, on: true, lote: '', qtd: '' })
+  draw(true)
+}
+function mxCheck(o) {
+  const liv = DB.misturadores.filter((m) => m.status === 'DISPONÍVEL')
+  if (!liv.some((m) => m.id === MX.mix)) MX.mix = liv[0] ? liv[0].id : ''
+  const linhas = MX.mats
+    .map(
+      (m, i) =>
+        `<div class="mat ${m.on ? 'on' : ''}"><label class="mat-ck"><input type="checkbox" ${m.on ? 'checked' : ''} onchange="matOn(${i},this.checked)"><span>${m.custom ? `<input type="text" placeholder="Nome da matéria-prima" value="${escAttr(m.nome)}" oninput="MX.mats[${i}].nome=this.value">` : `<b>${m.nome}</b>`}<small>${m.cod || 'Adicionada manualmente'}</small></span></label><input type="text" placeholder="Lote / fornecedor" value="${escAttr(m.lote)}" ${m.on ? '' : 'disabled'} oninput="MX.mats[${i}].lote=this.value"><input type="text" inputmode="decimal" placeholder="Quantidade (kg)" value="${escAttr(m.qtd)}" ${m.on ? '' : 'disabled'} oninput="MX.mats[${i}].qtd=this.value"></div>`
+    )
+    .join('')
+  return `<div class="card"><h3>OP ${pad(o.id)} · ${o.produto}</h3><p>${f(o.plan)} kg · Lote ${o.lote} ${o.retrabalho ? `<span class="bd r">RETRABALHO #${o.retrabalho}</span>` : ''}</p>${mxIA(o)}<label>Misturador<select onchange="MX.mix=this.value">${liv.length ? liv.map((m) => `<option ${m.id === MX.mix ? 'selected' : ''}>${m.id}</option>`).join('') : '<option value="">Nenhum disponível</option>'}</select></label></div><div class="card"><h3>Matérias-primas utilizadas</h3><small>Marque o que foi usado e anote lote e quantidade.</small>${linhas}<button class="btn gr" onclick="addMat()">+ ADICIONAR MATÉRIA-PRIMA</button></div><div class="mx-foot"><button class="btn gr" onclick="mxVoltar()">VOLTAR</button><button class="btn ok" onclick="irCronometro()">INICIAR OP</button></div>`
+}
+function irCronometro() {
+  const o = op(MX.op),
+    sel = MX.mats.filter((x) => x.on),
+    n = (x) => parseFloat(String(x.qtd).replace(',', '.'))
+  if (!sel.length) return alert('Selecione ao menos uma matéria-prima.')
+  if (sel.some((x) => !(n(x) > 0) || (x.custom && !x.nome.trim())))
+    return alert(
+      'Informe nome (se adicionada) e quantidade de cada matéria-prima marcada.'
+    )
+  const m = DB.misturadores.find((x) => x.id === MX.mix)
+  if (!m || m.status !== 'DISPONÍVEL')
+    return alert('Selecione um misturador disponível.')
+  o.checklist = JSON.parse(JSON.stringify(MX.mats))
+  save()
+  MX.tela = 'cron'
+  draw(true)
+}
+
+/* 3) cronômetro */
+function mxCron(o) {
+  const m = DB.misturadores.find((x) => x.id === MX.mix) || {},
+    ini = o.status === 'EM MISTURA',
+    pausado = m.status === 'PAUSADO'
+  const btns = !ini
+    ? `<button class="btn gr" onclick="MX.tela='check';draw(true)">VOLTAR</button><button class="btn ok" onclick="iniciarOP()">▶ INICIAR OP</button>`
+    : `<button class="btn" onclick="pausarMix('${m.id}')">${pausado ? '▶ Retomar' : '❚❚ Pausar'}</button><button class="btn ok" onclick="concluirMix()">✓ Concluir</button>`
+  return `<div class="cronbox"><div class="cron-h"><span class="cron-ic">⏱</span>Cronômetro</div><div class="cron-sub">OP ${pad(o.id)} · ${o.produto} · ${MX.mix}</div><div class="cron-t" id="mxt">${mxFmt(mxTempo())}</div><div class="cron-l"><span>h</span><span>min</span><span>seg</span></div>${ini ? `<div class="cron-st ${pausado ? 'p' : ''}">${pausado ? '⏸ Pausado: ' + (m.motivo || '') : '● Em produção'}</div>` : ''}<div class="cron-btns">${btns}</div></div>`
+}
+function iniciarOP() {
+  const o = op(MX.op),
+    m = DB.misturadores.find((x) => x.id === MX.mix)
+  if (!m || m.status !== 'DISPONÍVEL') return alert('Misturador ocupado')
+  m.status = 'PRODUZINDO'
+  m.op = o.id
+  m.t0 = Date.now()
+  m.acum = 0
+  m.motivo = null
+  m.carga = o.retrabalho && o.prod ? o.prod : Math.round(o.plan * 0.99)
+  if (!o.retrabalho) o.mpKg = m.carga
+  o.mix = m.id
+  o.operador = U.nome
+  o.status = 'EM MISTURA'
+  o.mixIni = now()
+  o.mixConcluida = false
+  o.pausasMix = []
+  o.tempoMix = 0
+  o.teste = null
+  log(`Iniciou mistura no ${m.id} (OP ${pad(o.id)})`)
+  draw(true)
+}
+function concluirMix() {
+  const m = DB.misturadores.find((x) => x.id === MX.mix),
+    o = op(MX.op)
+  if (!m || m.op !== o.id) return
+  if (!confirm('Concluir a mistura desta OP?')) return
+  if (m.status === 'PAUSADO') mxFechaPausa(m)
+  m.acum = (m.acum || 0) + (Date.now() - m.t0)
+  o.tempoMix = Math.round(m.acum / 1000)
+  o.prod = m.carga
+  o.mixConcluida = true
+  o.mixFim = now()
+  m.status = 'DISPONÍVEL'
+  m.op = null
+  m.carga = 0
+  m.t0 = 0
+  m.acum = 0
+  m.motivo = null
+  log(`Concluiu mistura ${o.lote} em ${mxFmt(o.tempoMix * 1000)}`)
+  MX.tela = 'conc'
+  draw(true)
+}
+
+/* 4) tempo total */
+function mxConc(o) {
+  const ps = o.pausasMix || [],
+    par = ps.reduce((a, p) => a + p.seg, 0)
+  return `<div class="card" style="text-align:center"><h3>Mistura concluída · OP ${pad(o.id)}</h3><p>${o.produto} · Lote ${o.lote} · ${o.mix}</p><small>Tempo total de produção</small><div class="big" style="font-size:64px">${mxFmt(o.tempoMix * 1000)}</div>${ps.length ? `<p><small>${ps.length} pausa(s) · ${f(par / 60, 1)} min parado (não entra no tempo acima)</small></p>` : ''}<button class="btn ok" style="min-height:72px;font-size:22px" onclick="MX.tela='qual';draw(true)">ANÁLISE DE QUALIDADE</button></div>`
+}
+
+/* 5) formulário do teste (igual à folha de OP) */
+function mxQual(o) {
+  const t = MX.t
+  return `<div class="card"><h3>Teste de qualidade · OP ${pad(o.id)}</h3><p>${o.produto} · Lote ${o.lote} · Operador: ${U.nome}</p><div class="row">${ESPEC.map((e) => `<label>${e.n}${e.un ? ' (' + e.un + ')' : ''}<input type="text" inputmode="decimal" value="${escAttr(t[e.k])}" oninput="MX.t.${e.k}=this.value"><small class="espec">Faixa: ${f(e.min, e.d)} – ${f(e.max, e.d)}</small></label>`).join('')}<label>Teste de adesão de fita<select onchange="MX.t.fita=this.value"><option ${t.fita === 'OK' ? 'selected' : ''}>OK</option><option ${t.fita === 'NÃO OK' ? 'selected' : ''}>NÃO OK</option></select></label></div><label>Observações<textarea placeholder="Observações" oninput="MX.t.obs=this.value">${escAttr(t.obs || '')}</textarea></label></div><div class="mx-foot"><button class="btn gr" onclick="MX.tela='conc';draw(true)">VOLTAR</button><button class="btn ok" onclick="fazerAnalise()">FAZER ANÁLISE</button></div>`
+}
+function fazerAnalise() {
+  const o = op(MX.op),
+    t = MX.t,
+    n = (k) => parseFloat(String(t[k] || '').replace(',', '.'))
+  if (ESPEC.some((e) => isNaN(n(e.k))))
+    return alert('Preencha todos os campos numéricos do teste.')
+  o.teste = {
+    d1: n('d1'),
+    d2: n('d2'),
+    ph: n('ph'),
+    placas: n('placas'),
+    balde: n('balde'),
+    fita: t.fita || 'OK',
+    obs: t.obs || '',
+    por: U.nome,
+    em: now(),
+  }
+  o.mixConcluida = false
+  o.status = 'AGUARDANDO LABORATÓRIO'
+  log(`Enviou lote ${o.lote} à qualidade (teste do misturador preenchido)`)
+  alerta('y', 'Lote ' + o.lote + ' aguardando qualidade')
+  MX = mxNovo()
+  if (ROLE[U.permissao].includes('lab')) ir('lab')
+  else {
+    alert('Lote enviado à qualidade.')
+    draw(true)
+  }
+}
 function sugestaoQualidade(lab, o) {
   const motivos = [],
     melhorias = []
@@ -1120,9 +1357,25 @@ function sugestaoQualidade(lab, o) {
   const visc = lab.visc || 0
   const ph = lab.ph || 0
 
+  /* teste preenchido no misturador (faixas da folha de OP) */
+  if (o.teste) {
+    ESPEC.forEach((e) => {
+      const v = o.teste[e.k]
+      if (!dentro(v, e))
+        motivos.push(
+          `${e.n} (${f(v, e.d)} ${e.un}) fora da faixa de ${f(e.min, e.d)}–${f(e.max, e.d)}.`
+        )
+    })
+    if (o.teste.fita !== 'OK')
+      motivos.push('O teste de adesão de fita não foi OK.')
+    if (motivos.length)
+      melhorias.push(
+        'Revisar a ordem de adição e a homogeneização e repetir o teste após o retrabalho.'
+      )
+  }
   if (lab.placas === 'REPROVADO')
     motivos.push('O ensaio de placas foi marcado como REPROVADO.')
-  if (difDens > 0.03) {
+  if (!o.teste && difDens > 0.03) {
     motivos.push(`A densidade variou ${f(difDens, 2)} g/mL entre as medições.`)
     melhorias.push(
       'Conferir a pesagem dos componentes e homogeneizar melhor o lote antes de retirar a nova amostra.'
@@ -1136,7 +1389,7 @@ function sugestaoQualidade(lab, o) {
       'Ajustar água ou aditivo somente conforme a receita, em pequenas doses, e misturar por mais 5–10 minutos antes de repetir o ensaio.'
     )
   }
-  if (ph && (ph < 7.5 || ph > 8.5)) {
+  if (!o.teste && ph && (ph < 7.5 || ph > 8.5)) {
     motivos.push(
       `O pH medido (${f(ph, 1)}) está fora da faixa de referência de 7,5–8,5.`
     )
@@ -1464,34 +1717,29 @@ const V_ = {
       )
       .join('')
   },
+  /* NOVO FLUXO: lista → checklist → cronômetro → conclusão → teste de qualidade */
   mix() {
-    const fila = DB.ordensProducao.filter(
-      (o) => o.status === 'AGUARDANDO PRODUÇÃO'
-    )
-    return `<div class="grid">${DB.misturadores.map((m) => `<div class="card"><h3>${m.id}</h3>${bd(m.status)}<p>Temperatura: <b>${f(m.temp, 1)} °C</b><br>Velocidade: <b>${m.rpm} RPM</b><br>Carga: <b>${f(m.carga)} kg</b><br>OP: <b>${m.op ? pad(m.op) : '—'}</b> ${m.op ? '· ' + op(m.op).lote : ''}<br>Tempo: <b>${m.t0 && m.status === 'PRODUZINDO' ? new Date(Date.now() - m.t0).toISOString().substr(11, 8) : '—'}</b></p>${m.status === 'PAUSADO' && m.motivo ? `<div class="al y">⏸ Pausado: ${m.motivo}</div>` : ''}${m.op ? `<button class="btn gr" onclick="pausarMix('${m.id}')">${m.status === 'PAUSADO' ? 'RETOMAR' : 'PAUSAR'}</button><button class="btn ok" onclick="finMix('${m.id}')">FINALIZAR E ENVIAR À QUALIDADE</button>` : ''}</div>`).join('')}</div>
- <h3>OPs aguardando produção</h3>${
-   fila
-     .map(
-       (o) =>
-         `<div class="card">OP ${pad(o.id)} · ${o.produto} · ${f(o.plan)} kg · ${o.lote} ${o.retrabalho ? `<span class="bd r">RETRABALHO #${o.retrabalho}</span>` : ''}${o.retrabalho && o.sugestaoIA ? `<div class="al y" style="margin:10px 0"><b>🤖 ${o.sugestaoIA.titulo}</b><br><b>Motivo:</b> ${o.sugestaoIA.motivo}<br><b>Melhoria:</b> ${o.sugestaoIA.melhoria}</div>` : ''}<select id="mx${o.id}">${DB.misturadores
-           .filter((m) => m.status === 'DISPONÍVEL')
-           .map((m) => `<option>${m.id}</option>`)
-           .join(
-             ''
-           )}</select><button class="btn" onclick="iniciarMix(${o.id})">INICIAR MISTURA</button></div>`
-     )
-     .join('') || '<div class="card">Nenhuma OP na fila.</div>'
- }`
+    if (MX.tela !== 'lista' && !op(MX.op)) MX = mxNovo()
+    const o = op(MX.op)
+    return {
+      lista: () => mxLista(),
+      check: () => mxCheck(o),
+      cron: () => mxCron(o),
+      conc: () => mxConc(o),
+      qual: () => mxQual(o),
+    }[MX.tela]()
   },
   lab() {
     const l = DB.ordensProducao.filter(
       (o) => o.status === 'AGUARDANDO LABORATÓRIO'
     )
+    const vv = (x) => String(x).replace('.', ',')
     return (
       l
         .map((o) => {
-          const x = o.lab || {}
-          return `<div class="card"><h3>OP ${pad(o.id)} · Lote ${o.lote}</h3>${o.produto} ${o.lab ? bd('REPROVADO') : ''}<div class="row"><label>Densidade inicial<input id="d1${o.id}" value="1,42"></label><label>Densidade final<input id="d2${o.id}" value="1,41"></label><label>pH<input id="ph${o.id}" value="8,1"></label><label>Viscosidade (cP)<input id="vi${o.id}" value="${Math.round(R(4300, 5000))}"></label><label>Temperatura (°C)<input id="tp${o.id}" value="25,8"></label><label>Placas<select id="pl${o.id}"><option>APROVADO</option><option>REPROVADO</option></select></label></div><textarea id="ob${o.id}" placeholder="Observações"></textarea><button class="btn ok" onclick="analisar(${o.id},true)">APROVAR LOTE</button><button class="btn no" onclick="analisar(${o.id},false)">REPROVAR LOTE</button></div>`
+          const t = o.teste,
+            pl = t && !dentro(t.placas, ESPEC[3]) ? 'REPROVADO' : 'APROVADO'
+          return `<div class="card"><h3>OP ${pad(o.id)} · Lote ${o.lote}</h3>${o.produto} ${o.lab ? bd('REPROVADO') : ''}${mxResumoTeste(o)}<div class="row"><label>Densidade inicial<input id="d1${o.id}" value="${t ? vv(t.d1) : '1,42'}"></label><label>Densidade final<input id="d2${o.id}" value="${t ? vv(t.d2) : '1,41'}"></label><label>pH<input id="ph${o.id}" value="${t ? vv(t.ph) : '8,1'}"></label><label>Viscosidade (cP)<input id="vi${o.id}" value="${Math.round(R(4300, 5000))}"></label><label>Temperatura (°C)<input id="tp${o.id}" value="25,8"></label><label>Placas<select id="pl${o.id}"><option ${pl === 'APROVADO' ? 'selected' : ''}>APROVADO</option><option ${pl === 'REPROVADO' ? 'selected' : ''}>REPROVADO</option></select></label></div><textarea id="ob${o.id}" placeholder="Observações">${t ? escAttr(t.obs) : ''}</textarea><button class="btn ok" onclick="analisar(${o.id},true)">APROVAR LOTE</button><button class="btn no" onclick="analisar(${o.id},false)">REPROVAR LOTE</button></div>`
         })
         .join('') || '<div class="card">Nenhum lote aguardando análise.</div>'
     )
@@ -1855,6 +2103,7 @@ function draw(force) {
 }
 function sair() {
   U = null
+  MX = mxNovo()
   sessionStorage.clear()
   stopCam()
   document.body.classList.remove('nav-open', 'logged')
